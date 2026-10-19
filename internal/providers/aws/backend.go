@@ -613,8 +613,8 @@ func (b *awsLeaseBackend) releaseLease(ctx context.Context, req core.ReleaseLeas
 				}
 				return core.FixedObservation[core.Server]{Candidates: []core.Server{req.Lease.Server}}, nil
 			},
-			DeleteExact: func(ctx context.Context, _ *core.FixedTransaction, server core.Server) error {
-				err := deleteServer(ctx, awsConfigForServer(b.Cfg, server), server)
+			DeleteExact: func(ctx context.Context, tx *core.FixedTransaction, server core.Server) error {
+				err := deleteReleaseServer(ctx, awsConfigForServer(b.Cfg, server), server, *tx.Claim)
 				var keyErr *awsProviderKeyCleanupError
 				outcome.Terminal = err == nil || errors.As(err, &keyErr)
 				return err
@@ -626,7 +626,7 @@ func (b *awsLeaseBackend) releaseLease(ctx context.Context, req core.ReleaseLeas
 		if err := core.AuthorizeCheckpointRelease(exact, req.CheckpointID); err != nil {
 			return err
 		}
-		if err := deleteServer(ctx, awsConfigForServer(b.Cfg, req.Lease.Server), req.Lease.Server); err != nil {
+		if err := deleteReleaseServer(ctx, awsConfigForServer(b.Cfg, req.Lease.Server), req.Lease.Server, exact); err != nil {
 			var keyErr *awsProviderKeyCleanupError
 			if errors.As(err, &keyErr) {
 				outcome.Terminal = true
@@ -835,6 +835,37 @@ func deleteServer(ctx context.Context, cfg core.Config, server core.Server) erro
 		return err
 	}
 	return deleteAWSServerWithClient(ctx, client, server)
+}
+
+func deleteReleaseServer(ctx context.Context, cfg core.Config, server core.Server, claim core.LeaseClaim) error {
+	if !isCrabboxAWSLease(server) {
+		return core.Exit(4, "refusing to delete AWS instance %s without canonical Crabbox ownership tags", server.DisplayID())
+	}
+	client, err := newAWSClient(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	return deleteAWSReleaseServerWithClient(ctx, client, server, claim)
+}
+
+func deleteAWSReleaseServerWithClient(ctx context.Context, client awsClient, server core.Server, claim core.LeaseClaim) error {
+	if err := client.DeleteServer(ctx, server.CloudID); err != nil {
+		return err
+	}
+	cleanupKeyID, err := resolveAWSCleanupKeyID(ctx, client, server, claim)
+	if err != nil {
+		if core.IsAWSCleanupKeyOwnershipError(err) {
+			return nil
+		}
+		return &awsProviderKeyCleanupError{keyName: core.ServerProviderKey(server), err: err}
+	}
+	if cleanupKeyID == "" {
+		return nil
+	}
+	if err := client.DeleteCleanupSSHKeyID(ctx, cleanupKeyID); err != nil {
+		return &awsProviderKeyCleanupError{keyName: core.ServerProviderKey(server), err: err}
+	}
+	return nil
 }
 
 func deleteAWSServerWithClient(ctx context.Context, client awsClient, server core.Server) error {
